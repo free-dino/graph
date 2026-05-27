@@ -64,7 +64,25 @@ class ACOSolver(Solver):
         add = self._deposit_base * scale * (1.0 + order.p)
         self._pheromone[r][c] = min(self._pheromone_max, self._pheromone[r][c] + add)
 
-    def _update_pheromone(self, prev_orders: Dict[int, Order], new_orders: Dict[int, Order]) -> None:
+    def _pending_scale(self, order: Order, t: int, T: int) -> float:
+        slack = order.et - t
+        if slack >= 0:
+            urgency = 1.0 + 1.0 / (1.0 + slack)
+        else:
+            overdue = -slack
+            urgency = 2.0 + min(1.0, overdue / max(T, 1))
+        age = max(t - order.appear_t, 0)
+        freshness = 1.0 / (1.0 + age / max(T, 1))
+        base = 0.07 if order.picked else 0.05
+        return base * urgency * freshness
+
+    def _update_pheromone(
+        self,
+        prev_orders: Dict[int, Order],
+        new_orders: Dict[int, Order],
+        t: int,
+        T: int,
+    ) -> None:
         self._evaporate()
         delivered = set(prev_orders) - set(new_orders)
         for oid in delivered:
@@ -75,6 +93,12 @@ class ACOSolver(Solver):
         for oid in appeared:
             order = new_orders[oid]
             self._deposit((order.sx, order.sy), order, scale=0.2)
+        for order in new_orders.values():
+            scale = self._pending_scale(order, t, T)
+            if order.picked:
+                self._deposit((order.ex, order.ey), order, scale=scale)
+            else:
+                self._deposit((order.sx, order.sy), order, scale=scale)
 
     # ------------------------------------------------------------------
     # BFS utilities
@@ -301,7 +325,7 @@ class ACOSolver(Solver):
             actions = self._decide_actions(obs)
             prev_orders = obs["orders"]
             obs, _, done, _ = self.env.step(actions)
-            self._update_pheromone(prev_orders, obs["orders"])
+            self._update_pheromone(prev_orders, obs["orders"], int(obs["t"]), int(obs["T"]))
             if done:
                 break
 
