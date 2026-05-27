@@ -1,11 +1,12 @@
 from __future__ import annotations
+	
 import hashlib
 import random
 import time
 from collections import deque
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
 
-from env import DeliveryEnv, Order, Shipper, is_valid_cell, valid_next_pos
+from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.solver import Solver
 
 
@@ -42,11 +43,16 @@ class ACOSolver(Solver):
         self._alpha = 1.2
         self._beta = 2.0
         self._evaporation = 0.05
-        self._pheromone_min = 0.01
+        self._pheromone_min = 0.05
         self._pheromone_max = 5.0
         self._deposit_base = 0.6
+        self._epsilon = 1e-6
+        self._min_reward = 0.05
         self._rng = random.Random(self._stable_seed(self.env.config_name))
-        
+
+    # ------------------------------------------------------------------
+    # RNG/pheromone utilities
+    # ------------------------------------------------------------------
     @staticmethod
     def _stable_seed(name: str) -> int:
         digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
@@ -64,13 +70,25 @@ class ACOSolver(Solver):
         add = self._deposit_base * scale * (1.0 + order.p)
         self._pheromone[r][c] = min(self._pheromone_max, self._pheromone[r][c] + add)
 
-    def _update_pheromone(self, prev_orders: Dict[int, Order], new_orders: Dict[int, Order]) -> None:
+    def _reward_scale(self, reward: float) -> float:
+        return 0.5 + min(reward / 20.0, 2.0)
+
+    def _update_pheromone(
+        self,
+        prev_orders: Dict[int, Order],
+        new_orders: Dict[int, Order],
+        t: int,
+        T: int,
+    ) -> None:
         self._evaporate()
         delivered = set(prev_orders) - set(new_orders)
+        t_delivery = max(t - 1, 0)
         for oid in delivered:
             order = prev_orders[oid]
-            self._deposit((order.sx, order.sy), order, scale=0.6)
-            self._deposit((order.ex, order.ey), order, scale=1.0)
+            reward = delivery_reward(order, t_delivery, T)
+            scale = self._reward_scale(reward)
+            self._deposit((order.sx, order.sy), order, scale=0.4 * scale)
+            self._deposit((order.ex, order.ey), order, scale=0.8 * scale)
         appeared = set(new_orders) - set(prev_orders)
         for oid in appeared:
             order = new_orders[oid]
@@ -166,7 +184,7 @@ class ACOSolver(Solver):
         total = sum(score for score, _ in scored)
         if total <= 0:
             min_score = min(score for score, _ in scored)
-            adjusted = [(score - min_score + 1e-6, order) for score, order in scored]
+            adjusted = [(score - min_score + self._epsilon, order) for score, order in scored]
             total = sum(score for score, _ in adjusted)
             threshold = self._rng.random() * total
             acc = 0.0
@@ -183,18 +201,25 @@ class ACOSolver(Solver):
                 return order
         return scored[-1][1]
 
-    def _heuristic(self, order: Order, distance: int, slack: int, T: int) -> float:
-        urgency = 1.0 + 1.0 / (1.0 + slack)
-        priority = 1.0 + order.p
-        return (priority * urgency) / (distance + 1.0)
+    def _alpha_at(self, t: int, T: int) -> float:
+        progress = min(max(t / max(T, 1), 0.0), 1.0)
+        return self._alpha * (0.7 + 0.6 * progress)
+
+    def _expected_reward(self, order: Order, t_delivery: int, T: int) -> float:
+        reward = delivery_reward(order, t_delivery, T)
+        return max(reward, self._min_reward)
+
+    def _heuristic(self, order: Order, distance: int, t_delivery: int, T: int) -> float:
+        reward = self._expected_reward(order, t_delivery, T)
+        return reward / (distance + 1.0)
 
     def _delivery_heuristic(self, order: Order, distance: int, t: int, T: int) -> float:
-        slack = max(order.et - t, 0)
-        return self._heuristic(order, distance, slack, T)
+        t_delivery = t + distance
+        return self._heuristic(order, distance, t_delivery, T)
 
     def _pickup_heuristic(self, order: Order, total_dist: int, t: int, T: int) -> float:
-        slack = max(order.et - t - total_dist, 0)
-        return self._heuristic(order, total_dist, slack, T)
+        t_delivery = t + total_dist
+        return self._heuristic(order, total_dist, t_delivery, T)
 
     def _select_delivery(self, shipper: Shipper, orders: Dict[int, Order], t: int, T: int) -> Optional[Order]:
         carried_orders = [
@@ -206,6 +231,7 @@ class ACOSolver(Solver):
             return None
 
         scored: List[Tuple[float, Order]] = []
+        alpha = self._alpha_at(t, T)
         for order in carried_orders:
             target = (order.ex, order.ey)
             dist = self._distance(shipper.position, target)
@@ -213,7 +239,7 @@ class ACOSolver(Solver):
                 continue
             pheromone = self._pheromone[target[0]][target[1]]
             heuristic = self._delivery_heuristic(order, dist, t, T)
-            score = (pheromone ** self._alpha) * (heuristic ** self._beta)
+            score = (pheromone ** alpha) * (heuristic ** self._beta)
             scored.append((score, order))
         if not scored:
             return None
@@ -228,6 +254,7 @@ class ACOSolver(Solver):
         T: int,
     ) -> Optional[Order]:
         scored: List[Tuple[float, Order]] = []
+        alpha = self._alpha_at(t, T)
         for order in orders.values():
             if order.id in reserved_order_ids:
                 continue
@@ -241,9 +268,11 @@ class ACOSolver(Solver):
             if dist_drop >= INF:
                 continue
             total_dist = dist_pick + dist_drop
-            pheromone = self._pheromone[pickup[0]][pickup[1]]
+            pheromone_pick = self._pheromone[pickup[0]][pickup[1]]
+            pheromone_drop = self._pheromone[order.ex][order.ey]
+            pheromone = 0.6 * pheromone_pick + 0.4 * pheromone_drop
             heuristic = self._pickup_heuristic(order, total_dist, t, T)
-            score = (pheromone ** self._alpha) * (heuristic ** self._beta)
+            score = (pheromone ** alpha) * (heuristic ** self._beta)
             scored.append((score, order))
         if not scored:
             return None
@@ -301,7 +330,7 @@ class ACOSolver(Solver):
             actions = self._decide_actions(obs)
             prev_orders = obs["orders"]
             obs, _, done, _ = self.env.step(actions)
-            self._update_pheromone(prev_orders, obs["orders"])
+            self._update_pheromone(prev_orders, obs["orders"], int(obs["t"]), int(obs["T"]))
             if done:
                 break
 
