@@ -70,16 +70,7 @@ class ACOSolver(Solver):
         add = self._deposit_base * scale * (1.0 + order.p)
         self._pheromone[r][c] = min(self._pheromone_max, self._pheromone[r][c] + add)
 
-    def _reward_scale(self, reward: float) -> float:
-        return 0.5 + min(reward / 20.0, 2.0)
-
-    def _update_pheromone(
-        self,
-        prev_orders: Dict[int, Order],
-        new_orders: Dict[int, Order],
-        t: int,
-        T: int,
-    ) -> None:
+    def _update_pheromone(self, prev_orders: Dict[int, Order], new_orders: Dict[int, Order]) -> None:
         self._evaporate()
         delivered = set(prev_orders) - set(new_orders)
         t_delivery = max(t - 1, 0)
@@ -93,6 +84,12 @@ class ACOSolver(Solver):
         for oid in appeared:
             order = new_orders[oid]
             self._deposit((order.sx, order.sy), order, scale=0.2)
+        for order in new_orders.values():
+            scale = self._pending_scale(order, t, T)
+            if order.picked:
+                self._deposit((order.ex, order.ey), order, scale=scale)
+            else:
+                self._deposit((order.sx, order.sy), order, scale=scale)
 
     # ------------------------------------------------------------------
     # BFS utilities
