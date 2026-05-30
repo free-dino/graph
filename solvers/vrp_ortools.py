@@ -5,25 +5,21 @@ from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 from env import (
-    ALPHA, BETA, DeliveryEnv, Order, Shipper,
-    delivery_reward, is_valid_cell, r_base, valid_next_pos,
+    ALPHA, DeliveryEnv, Order, Shipper,
+    delivery_reward, is_valid_cell, valid_next_pos,
 )
 from solvers.solver import Solver
-
-from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 
 INF = 10 ** 9
 MOVES = ("U", "D", "L", "R")
 Position = Tuple[int, int]
 Move = str
 
-REWARD_SCALE = 100  # scale float rewards → int costs for OR-Tools
-
 
 class VRPOrToolsSolver(Solver):
 
-    REPLAN_INTERVAL = 3   # re-solve VRP every N steps
-    VRP_TIME_LIMIT = 0.5  # seconds per OR-Tools call
+    REPLAN_INTERVAL = 3    # re-solve VRP every N steps
+    VRP_TIME_LIMIT  = 0.5  # seconds per VRP call
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
@@ -62,8 +58,7 @@ class VRPOrToolsSolver(Solver):
         if parent is None or b not in parent:
             self._dist_cache[key] = INF
             return INF
-        dist = 0
-        cur: Position = b
+        dist, cur = 0, b
         while cur != a:
             prev = parent[cur][0]
             if prev is None:
@@ -84,7 +79,7 @@ class VRPOrToolsSolver(Solver):
         if parent is None or b not in parent:
             self._move_cache[key] = "S"
             return "S"
-        cur: Position = b
+        cur = b
         while parent[cur][0] != a:
             prev = parent[cur][0]
             if prev is None:
@@ -94,20 +89,7 @@ class VRPOrToolsSolver(Solver):
         self._move_cache[key] = parent[cur][1]
         return parent[cur][1]
 
-    # ================================================================ Reward helpers
-
-    def _max_reward(self, order: Order) -> float:
-        """Upper bound on reward: on-time with maximum early bonus."""
-        return ALPHA[order.p] * r_base(order.w) * 2.0
-
-    def _late_penalty_rate(self, order: Order) -> int:
-        """
-        OR-Tools integer cost per time unit delivery exceeds the deadline.
-        Reflects the actual per-unit reward gap between on-time and late delivery.
-        High-priority orders have a larger gap, so they get a larger penalty.
-        """
-        gap = (ALPHA[order.p] - BETA[order.p]) * r_base(order.w)
-        return max(1, int(gap * REWARD_SCALE))
+    # ------------------------------------------------------------------ Helpers
 
     def _is_worth_picking(self, order: Order, shipper: Shipper, t: int, T: int) -> bool:
         """False if this order cannot possibly yield a positive reward."""
@@ -117,16 +99,10 @@ class VRPOrToolsSolver(Solver):
         return t_arrive < T and delivery_reward(order, t_arrive, T) > 0.0
 
     def _delivery_slack(self, order: Order, pos: Position, t: int) -> float:
-        """
-        Remaining time after reaching delivery minus deadline, scaled by priority.
-        Negative = already behind. Lower → handle sooner.
-        Dividing by ALPHA[p] makes high-priority orders comparatively more urgent.
-        """
         dist = self._distance(pos, (order.ex, order.ey))
         return ((order.et - t) - dist) / ALPHA[order.p]
 
     def _pickup_slack(self, order: Order, pos: Position, t: int) -> float:
-        """Like _delivery_slack but also accounts for travel to the pickup point."""
         dist_p = self._distance(pos, (order.sx, order.sy))
         dist_d = self._distance((order.sx, order.sy), (order.ex, order.ey))
         return ((order.et - t) - dist_p - dist_d) / ALPHA[order.p]
@@ -134,23 +110,10 @@ class VRPOrToolsSolver(Solver):
     # ------------------------------------------------------------------ VRP
 
     def _solve_vrp(self, obs: dict) -> Dict[int, List[int]]:
-        """
-        Capacitated VRP assignment using OR-Tools.
-
-        Model: one node per unassigned order.
-          - Arc cost shipper_v  → order_i  = dist(shipper_v_pos, order_i_pickup)
-          - Arc cost order_i    → order_j  = dist(order_i_delivery, order_j_pickup)
-          - Arc cost order_i    → end_v    = 0   (no return-to-depot cost)
-        This naturally encodes that after delivering order i the shipper
-        travels to the next order's pickup, without needing PDP constraints.
-
-        Capacity: weight and slot dimensions enforce W_max / K_max.
-        Each order is optional via AddDisjunction with a priority-weighted penalty.
-
-        Returns {shipper_id: [order_id, ...]} — assignment per shipper.
-        """
         shippers: List[Shipper] = obs["shippers"]
         all_orders: Dict[int, Order] = obs["orders"]
+        t: int = obs["t"]
+        T: int = obs["T"]
 
         unassigned: List[Order] = [
             o for o in all_orders.values() if not o.picked and not o.delivered
@@ -159,94 +122,153 @@ class VRPOrToolsSolver(Solver):
         if not unassigned or not shippers:
             return result
 
-        C = len(shippers)
-        P = len(unassigned)
-        num_nodes = C + P  # shipper nodes + one node per order
+        shipper_by_id = {s.id: s for s in shippers}
 
-        # Positions: shipper current pos; order pickup pos (route SOURCE);
-        # order delivery pos (route DESTINATION after visiting order node).
-        shipper_pos = [(s.r, s.c) for s in shippers]
-        order_pickup = [(o.sx, o.sy) for o in unassigned]
-        order_delivery = [(o.ex, o.ey) for o in unassigned]
-
-        def arc_cost(from_node: int, to_node: int) -> int:
-            if from_node == to_node:
-                return 0
-            # Source: shipper start or previous order's delivery point
-            src = shipper_pos[from_node] if from_node < C else order_delivery[from_node - C]
-            # Destination: next order's pickup point (shipper-end nodes cost 0)
-            if to_node < C:
-                return 0
-            return self._distance(src, order_pickup[to_node - C])
-
-        dist_matrix = [
-            [arc_cost(i, j) for j in range(num_nodes)]
-            for i in range(num_nodes)
-        ]
-        finite = [d for row in dist_matrix for d in row if 0 < d < INF]
-        big = (max(finite) * 10 + 1) if finite else 10_000
-        dist_matrix = [[min(d, big) for d in row] for row in dist_matrix]
-
-        manager = pywrapcp.RoutingIndexManager(
-            num_nodes, C, list(range(C)), list(range(C))
-        )
-        routing = pywrapcp.RoutingModel(manager)
-
-        def transit_cb(fi: int, ti: int) -> int:
-            return dist_matrix[manager.IndexToNode(fi)][manager.IndexToNode(ti)]
-
-        transit_id = routing.RegisterTransitCallback(transit_cb)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_id)
-
-        # Weight capacity dimension (cumulative per shipper).
-        # This is conservative for sequential execution (delivers weight never
-        # decrements) but acts as a useful workload-balancing heuristic: it prevents
-        # OR-Tools from over-assigning heavy orders to one shipper.
-        def weight_demand(idx: int) -> int:
-            node = manager.IndexToNode(idx)
-            return int(unassigned[node - C].w * 10) if node >= C else 0
-
-        weight_id = routing.RegisterUnaryTransitCallback(weight_demand)
-        weight_caps = [
-            max(1, int(
-                (s.W_max - sum(all_orders[oid].w for oid in s.bag if oid in all_orders)) * 10
-            ))
+        # Remaining weight and slot capacity per shipper (excluding already-held orders)
+        w_cap: Dict[int, float] = {
+            s.id: s.W_max - sum(all_orders[oid].w for oid in s.bag if oid in all_orders)
             for s in shippers
+        }
+        k_cap: Dict[int, int] = {s.id: s.K_max - len(s.bag) for s in shippers}
+
+        # End position of each shipper's planned route (updated as orders are appended)
+        route_end: Dict[int, Position] = {s.id: (s.r, s.c) for s in shippers}
+
+        def feasible(sid: int, o: Order) -> bool:
+            return (
+                w_cap[sid] >= o.w
+                and k_cap[sid] > 0
+                and self._is_worth_picking(o, shipper_by_id[sid], t, T)
+            )
+
+        def append_cost(sid: int, o: Order) -> int:
+            """Distance cost of tacking order o onto the end of shipper sid's route."""
+            end = route_end[sid]
+            return (
+                self._distance(end, (o.sx, o.sy))
+                + self._distance((o.sx, o.sy), (o.ex, o.ey))
+            )
+
+        # ---- Phase 1: regret-based greedy insertion --------------------------
+        # Filter to orders that at least one shipper can serve, sort by urgency.
+        remaining: List[Order] = [
+            o for o in sorted(unassigned, key=lambda x: (-x.p, x.et))
+            if any(feasible(s.id, o) for s in shippers)
         ]
-        routing.AddDimensionWithVehicleCapacity(weight_id, 0, weight_caps, True, "Weight")
 
-        # Slot capacity dimension (number of orders per shipper).
-        def slot_demand(idx: int) -> int:
-            return 1 if manager.IndexToNode(idx) >= C else 0
+        t_phase1_end = time.time() + self.VRP_TIME_LIMIT * 0.55
+        while remaining and time.time() < t_phase1_end:
+            best_idx   = -1
+            best_sid   = None
+            best_regret = -INF
+            best_cost   = INF
 
-        slot_id = routing.RegisterUnaryTransitCallback(slot_demand)
-        slot_caps = [max(1, s.K_max - len(s.bag)) for s in shippers]
-        routing.AddDimensionWithVehicleCapacity(slot_id, 0, slot_caps, True, "Slots")
+            for idx, o in enumerate(remaining):
+                # Costs of assigning o to each feasible shipper, cheapest first
+                costs = sorted(
+                    (append_cost(s.id, o), s.id)
+                    for s in shippers if feasible(s.id, o)
+                )
+                if not costs:
+                    continue
+                c1, sid1 = costs[0]
+                # Regret = gap between best and second-best option
+                regret = costs[1][0] - c1 if len(costs) > 1 else c1
+                if regret > best_regret or (regret == best_regret and c1 < best_cost):
+                    best_regret, best_cost = regret, c1
+                    best_idx, best_sid = idx, sid1
 
-        # Each order is optional: not serving it costs max_reward (priority-scaled)
-        for i, o in enumerate(unassigned):
-            penalty = max(1, int(self._max_reward(o) * REWARD_SCALE))
-            routing.AddDisjunction([manager.NodeToIndex(C + i)], penalty)
+            if best_sid is None:
+                break  # no order can be assigned any more
 
-        params = pywrapcp.DefaultRoutingSearchParameters()
-        params.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-        )
-        params.time_limit.FromMilliseconds(max(200, int(self.VRP_TIME_LIMIT * 1000)))
+            o = remaining.pop(best_idx)
+            result[best_sid].append(o.id)
+            route_end[best_sid] = (o.ex, o.ey)
+            w_cap[best_sid] -= o.w
+            k_cap[best_sid] -= 1
 
-        solution = routing.SolveWithParameters(params)
-        if not solution:
-            return result
+        # ---- Phase 2: Or-opt-1 inter-route relocation ------------------------
+        # Helper: position just before index `pos` in a route.
+        def prev_pos(route: List[int], pos: int, start: Position) -> Position:
+            if pos == 0:
+                return start
+            prev_o = all_orders[route[pos - 1]]
+            return (prev_o.ex, prev_o.ey)
 
-        for v, s in enumerate(shippers):
-            route: List[int] = []
-            idx = routing.Start(v)
-            while not routing.IsEnd(idx):
-                node = manager.IndexToNode(idx)
-                if node >= C:
-                    route.append(unassigned[node - C].id)
-                idx = solution.Value(routing.NextVar(idx))
-            result[s.id] = route
+        # Cost change from *removing* the order at src_pos from route.
+        # Negative value = we save travel distance by removing it.
+        def removal_delta(
+            route: List[int], pos: int, start: Position, o: Order
+        ) -> int:
+            p, d = (o.sx, o.sy), (o.ex, o.ey)
+            before_pos = prev_pos(route, pos, start)
+
+            cost_before = self._distance(before_pos, p) + self._distance(p, d)
+            if pos + 1 < len(route):
+                nxt_pick = (all_orders[route[pos + 1]].sx, all_orders[route[pos + 1]].sy)
+                cost_before += self._distance(d, nxt_pick)
+                cost_after   = self._distance(before_pos, nxt_pick)
+            else:
+                cost_after = 0
+
+            return cost_after - cost_before  # negative = savings
+
+        # Cost change from *inserting* order o at dst_pos in route.
+        # Positive value = we pay more travel distance to include it.
+        def insertion_delta(
+            route: List[int], pos: int, start: Position, o: Order
+        ) -> int:
+            p, d = (o.sx, o.sy), (o.ex, o.ey)
+            before_pos = prev_pos(route, pos, start)
+
+            added = self._distance(before_pos, p) + self._distance(p, d)
+            if pos < len(route):
+                nxt_pick = (all_orders[route[pos]].sx, all_orders[route[pos]].sy)
+                added += self._distance(d, nxt_pick) - self._distance(before_pos, nxt_pick)
+
+            return added
+
+        t_phase2_end = time.time() + self.VRP_TIME_LIMIT * 0.45
+        improved = True
+        while improved and time.time() < t_phase2_end:
+            improved = False
+            for src_s in shippers:
+                src_start = (src_s.r, src_s.c)
+                src_pos = 0
+                while src_pos < len(result[src_s.id]):
+                    oid = result[src_s.id][src_pos]
+                    o   = all_orders[oid]
+                    rem = removal_delta(result[src_s.id], src_pos, src_start, o)
+
+                    moved = False
+                    for dst_s in shippers:
+                        if dst_s.id == src_s.id:
+                            continue
+                        if w_cap[dst_s.id] < o.w or k_cap[dst_s.id] <= 0:
+                            continue
+
+                        dst_start = (dst_s.r, dst_s.c)
+                        dst_route = result[dst_s.id]
+                        for dst_pos in range(len(dst_route) + 1):
+                            if rem + insertion_delta(dst_route, dst_pos, dst_start, o) < -1:
+                                result[src_s.id].pop(src_pos)
+                                result[dst_s.id].insert(dst_pos, oid)
+                                w_cap[src_s.id] += o.w
+                                w_cap[dst_s.id] -= o.w
+                                k_cap[src_s.id] += 1
+                                k_cap[dst_s.id] -= 1
+                                improved = True
+                                moved = True
+                                break
+                        if moved:
+                            break
+
+                    if not moved:
+                        src_pos += 1
+                    if improved:
+                        break
+                if improved:
+                    break
 
         return result
 
@@ -254,22 +276,21 @@ class VRPOrToolsSolver(Solver):
 
     def _update_assignments(self, obs: dict) -> None:
         """Re-solve VRP and merge new assignments into _pending_pickups.
-        Falls back to greedy assignment for any order the VRP did not cover."""
+        Falls back to greedy for any order the VRP did not cover."""
         try:
             vrp_result = self._solve_vrp(obs)
         except Exception:
             vrp_result = {s.id: [] for s in obs["shippers"]}
 
         for sid, order_ids in vrp_result.items():
-            existing = self._pending_pickups.get(sid, [])
+            existing     = self._pending_pickups.get(sid, [])
             existing_set = set(existing)
-            new_orders = [oid for oid in order_ids if oid not in existing_set]
+            new_orders   = [oid for oid in order_ids if oid not in existing_set]
             self._pending_pickups[sid] = existing + new_orders
 
         # Greedy fallback: assign any order not covered by VRP to the best shipper.
-        # This handles VRP capacity drops, infeasible sub-problems, or timeout failures.
         all_orders: Dict[int, Order] = obs["orders"]
-        shippers: List[Shipper] = obs["shippers"]
+        shippers:   List[Shipper]    = obs["shippers"]
         t: int = obs["t"]
         T: int = obs["T"]
 
@@ -298,8 +319,7 @@ class VRPOrToolsSolver(Solver):
     ) -> Tuple[Move, int]:
         pos: Position = (s.r, s.c)
 
-        # Priority 1: deliver in-bag orders — most urgent (lowest deadline slack) first.
-        # Urgency is scaled by ALPHA[p] so high-priority orders are treated as more pressing.
+        # Priority 1: deliver in-bag orders — most urgent first
         deliverable = [
             orders[oid] for oid in s.bag if oid in orders and not orders[oid].delivered
         ]
@@ -307,10 +327,10 @@ class VRPOrToolsSolver(Solver):
             target = min(deliverable, key=lambda o: self._delivery_slack(o, pos, t))
             goal: Position = (target.ex, target.ey)
             move = self._next_move(pos, goal)
-            nxt = valid_next_pos(pos, move, self.grid)
+            nxt  = valid_next_pos(pos, move, self.grid)
             return (move, 2) if nxt == goal else (move, 0)
 
-        # Priority 2: pick up the most urgent assigned order that is still profitable.
+        # Priority 2: pick up the most urgent assigned order that is still profitable
         pending = self._pending_pickups.get(s.id, [])
         pending_valid = [
             oid for oid in pending
@@ -327,26 +347,24 @@ class VRPOrToolsSolver(Solver):
                 pending_valid,
                 key=lambda oid: self._pickup_slack(orders[oid], pos, t),
             )
-            o = orders[best_oid]
+            o    = orders[best_oid]
             goal = (o.sx, o.sy)
             move = self._next_move(pos, goal)
-            nxt = valid_next_pos(pos, move, self.grid)
+            nxt  = valid_next_pos(pos, move, self.grid)
             return (move, 1) if nxt == goal else (move, 0)
 
         return "S", 0
 
-    # ------------------------------------------------------------------ Run
-
     def run(self) -> dict:
-        start_time = time.time()
-        obs = self.env.reset()
+        start_time   = time.time()
+        obs          = self.env.reset()
         last_replan_t = -1
 
         while not obs.get("done", False):
             t: int = obs["t"]
             T: int = obs["T"]
             new_orders_arrived = bool(obs.get("new_order_ids"))
-            all_queues_empty = all(
+            all_queues_empty   = all(
                 not self._pending_pickups.get(s.id) for s in obs["shippers"]
             )
 
